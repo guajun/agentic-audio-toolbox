@@ -1,0 +1,4 @@
+#!/bin/sh
+# POSIX launcher for the audio-toolbox CLI (implementation lives inside the skill
+# directory so that an installed copy of skills/sam-audio stays self-contained).
+exec "${PYTHON:-python3}" "$(dirname "$0")/../skills/sam-audio/scripts/audio_toolbox.py" "$@"
