@@ -67,10 +67,12 @@ python -m unittest discover -s tests -v
 ```
 
 CPU-only: the SAM entry is replaced by fake entry scripts in temporary
-directories (including paths with spaces and shell metacharacters). Covered:
-`--help`/usage surface, structured errors and exit codes, anchor validation,
-argv passthrough without shell injection, timeouts, upstream failures,
-dry-run plans, run-dir/output collection, and environment preflight.
+directories (including paths with spaces, non-ASCII names and shell
+metacharacters). Covered: `--help`/usage surface, structured errors and exit
+codes, anchor validation, argv passthrough without shell injection, timeouts,
+upstream failures, dry-run plan validation (long/incomplete/missing/nested
+plan JSON), run-dir/output collection, corrupt-report rejection, offline env
+enforcement, locale-independent UTF-8 decoding, and environment preflight.
 
 Real-model GPU inference is intentionally out of scope here
 (anonymous-audio-tracks #33); dry-run/check-environment exercise the real SAM

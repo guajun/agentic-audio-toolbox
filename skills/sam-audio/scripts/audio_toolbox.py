@@ -63,12 +63,27 @@ ERROR_EXIT_CODES = {
     "E_UPSTREAM_TIMEOUT": EXIT_TIMEOUT,
     "E_RUN_DIR_UNKNOWN": EXIT_OUTPUT,
     "E_OUTPUT_MISSING": EXIT_OUTPUT,
+    "E_PLAN_INVALID": EXIT_OUTPUT,
+    "E_REPORT_INVALID": EXIT_OUTPUT,
 }
 
 TAIL_LIMIT = 2000
 DEFAULT_TIMEOUT_S = 3600.0
 CHECK_TIMEOUT_S = 120.0
 EXPECTED_ARTIFACTS = ("target.wav", "residual.wav", "request.json", "report.json")
+# Top-level fields of the upstream dry-run plan (pinned entry writes exactly these).
+PLAN_REQUIRED_FIELDS = (
+    "audio",
+    "duration_s",
+    "description",
+    "anchors",
+    "model_dir",
+    "text_encoder_dir",
+    "device",
+    "dtype",
+    "output_dir",
+    "network",
+)
 
 
 # --------------------------------------------------------------------------- output
@@ -129,11 +144,43 @@ class _UsageError(Exception):
         self.message = message
 
 
-def _tail_json_block(stdout: str) -> dict | None:
-    """Parse the first JSON object found in upstream stdout, if any."""
+def _decode(raw: bytes | str | None) -> str:
+    """Decode captured child output as UTF-8 with replacement, never raising.
+
+    ``text=True`` decoders use the locale codec on Windows (e.g. GBK) and can
+    crash a reader thread on undecodable bytes; capturing bytes and decoding
+    here keeps the one-JSON result promise intact.
+    """
+
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    return raw.decode("utf-8", errors="replace")
+
+
+def _plan_complete(value: object) -> bool:
+    return isinstance(value, dict) and all(field in value for field in PLAN_REQUIRED_FIELDS)
+
+
+def _parse_plan(stdout: str) -> tuple[dict | None, str | None]:
+    """Extract the upstream dry-run plan from complete stdout.
+
+    The full (untruncated) stdout is parsed: first as one whole JSON document,
+    then by scanning for JSON objects that contain every required plan field.
+    Nested/truncated fragments never qualify. Returns ``(plan, error_reason)``.
+    """
+
     text = (stdout or "").strip()
     if not text:
-        return None
+        return None, "upstream dry-run produced no stdout"
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        if _plan_complete(value):
+            return value, None
     decoder = json.JSONDecoder()
     for index, char in enumerate(text):
         if char != "{":
@@ -142,9 +189,9 @@ def _tail_json_block(stdout: str) -> dict | None:
             value, _ = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict):
-            return value
-    return None
+        if _plan_complete(value):
+            return value, None
+    return None, "no JSON object with the expected top-level plan fields was found in upstream stdout"
 
 
 def _parse_anchors(raw: list[str] | None) -> list[tuple[float, float]]:
@@ -202,10 +249,20 @@ class _EnvironmentError(Exception):
 
 def _upstream_env() -> dict:
     env = dict(os.environ)
-    # The SAM entry is offline by policy; make that explicit and independent of user env.
-    env.setdefault("HF_HUB_OFFLINE", "1")
-    env.setdefault("TRANSFORMERS_OFFLINE", "1")
+    # Offline is a hard policy of this wrapper: never inherit a relaxed value
+    # (setdefault would preserve an inherited HF_HUB_OFFLINE=0). The parent
+    # process environment is left untouched.
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
+    # Explicit UTF-8 child stdio; output is then decoded UTF-8 with replacement.
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
+
+
+def _upstream_public(upstream: dict) -> dict:
+    """Diagnostics view of the upstream result: bounded tails, no raw full output."""
+
+    return {key: value for key, value in upstream.items() if key != "stdout_full"}
 
 
 def _run_upstream(argv: list[str], timeout_s: float) -> dict:
@@ -215,18 +272,19 @@ def _run_upstream(argv: list[str], timeout_s: float) -> dict:
         completed = subprocess.run(
             argv,
             capture_output=True,
-            text=True,
             timeout=timeout_s,
             shell=False,
             env=_upstream_env(),
         )
     except subprocess.TimeoutExpired as error:
+        stdout_full = _decode(error.stdout)
         return {
             "timed_out": True,
             "exit_code": None,
             "duration_s": round(time.monotonic() - started, 3),
-            "stdout_tail": _tail(error.stdout.decode("utf-8", "replace") if isinstance(error.stdout, bytes) else error.stdout),
-            "stderr_tail": _tail(error.stderr.decode("utf-8", "replace") if isinstance(error.stderr, bytes) else error.stderr),
+            "stdout_full": stdout_full,
+            "stdout_tail": _tail(stdout_full),
+            "stderr_tail": _tail(_decode(error.stderr)),
         }
     except OSError as error:
         return {
@@ -234,15 +292,18 @@ def _run_upstream(argv: list[str], timeout_s: float) -> dict:
             "exit_code": None,
             "launch_error": f"{type(error).__name__}: {error}",
             "duration_s": round(time.monotonic() - started, 3),
+            "stdout_full": "",
             "stdout_tail": "",
             "stderr_tail": "",
         }
+    stdout_full = _decode(completed.stdout)
     return {
         "timed_out": False,
         "exit_code": completed.returncode,
         "duration_s": round(time.monotonic() - started, 3),
-        "stdout_tail": _tail(completed.stdout),
-        "stderr_tail": _tail(completed.stderr),
+        "stdout_full": stdout_full,
+        "stdout_tail": _tail(stdout_full),
+        "stderr_tail": _tail(_decode(completed.stderr)),
     }
 
 
@@ -339,7 +400,7 @@ def cmd_separate(args, action: str) -> int:
             "timeout_s": timeout_s,
             "sam_root": str(sam_root),
         },
-        "upstream": upstream,
+        "upstream": _upstream_public(upstream),
     }
 
     if upstream.get("timed_out"):
@@ -366,12 +427,20 @@ def cmd_separate(args, action: str) -> int:
         )
 
     if action == "sam.dry-run":
-        plan = _tail_json_block(upstream.get("stdout_tail", ""))
-        return _result({**base, "exit_code": EXIT_OK, "plan": plan, "outputs": {}, "run_dir": (plan or {}).get("output_dir")})
+        plan, plan_error = _parse_plan(upstream.get("stdout_full", ""))
+        if plan is None:
+            return _emit(
+                {**base, "ok": False, "exit_code": EXIT_OUTPUT, "plan": None, "outputs": {},
+                 "error": {"code": "E_PLAN_INVALID",
+                           "message": "SAM entry dry-run did not produce a valid plan: " + plan_error,
+                           "detail": {"required_fields": list(PLAN_REQUIRED_FIELDS)}}},
+                EXIT_OUTPUT,
+            )
+        return _result({**base, "exit_code": EXIT_OK, "plan": plan, "outputs": {}, "run_dir": plan.get("output_dir")})
 
     run_dir = Path(output_dir).expanduser().resolve() if output_dir else None
     if run_dir is None:
-        match = re.search(r"^Wrote (.+)$", upstream.get("stdout_tail", ""), flags=re.MULTILINE)
+        match = re.search(r"^Wrote (.+)$", upstream.get("stdout_full", ""), flags=re.MULTILINE)
         if match:
             run_dir = Path(match.group(1).strip())
     if run_dir is None:
@@ -392,18 +461,31 @@ def cmd_separate(args, action: str) -> int:
         else:
             missing.append(str(path))
     report = None
+    report_error = None
     report_path = run_dir / "report.json"
     if report_path.is_file():
         try:
             report = json.loads(report_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            report = {"parse_error": f"{type(error).__name__}: {error}"}
+            report_error = f"{type(error).__name__}: {error}"
+        else:
+            if not isinstance(report, dict):
+                report = None
+                report_error = "report.json does not contain a JSON object"
     if missing:
         return _emit(
             {**base, "ok": False, "exit_code": EXIT_OUTPUT, "run_dir": str(run_dir), "outputs": outputs,
              "error": {"code": "E_OUTPUT_MISSING",
                        "message": "expected artifacts were not written by the SAM entry",
                        "detail": {"missing": missing}}},
+            EXIT_OUTPUT,
+        )
+    if report_error is not None:
+        return _emit(
+            {**base, "ok": False, "exit_code": EXIT_OUTPUT, "run_dir": str(run_dir), "outputs": outputs,
+             "error": {"code": "E_REPORT_INVALID",
+                       "message": "report.json could not be read or parsed; the run is not a valid machine-readable result",
+                       "detail": {"report_path": str(report_path), "reason": report_error}}},
             EXIT_OUTPUT,
         )
     return _result({**base, "exit_code": EXIT_OK, "run_dir": str(run_dir), "outputs": outputs, "report": report})
@@ -471,7 +553,7 @@ def cmd_check_environment(args) -> int:
         "action": action,
         "exit_code": EXIT_OK if ok else EXIT_ENVIRONMENT,
         "checks": checks,
-        "upstream": upstream,
+        "upstream": _upstream_public(upstream),
         "failed_checks": required_failed,
     }
     if not ok:

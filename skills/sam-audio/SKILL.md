@@ -149,7 +149,11 @@ not shell syntax.
   `residual.wav` (everything else), `request.json` (the exact request plan),
   `report.json` (plan plus `outputs`, `elapsed_s`, `sample_rate`).
 * `plan` (dry-run) — what the SAM entry would execute: resolved audio path,
-  `duration_s`, anchors, model dirs, device, dtype, `network: "disabled"`.
+  `duration_s`, anchors, model dirs, device, dtype, `network: "disabled"`. The
+  plan is parsed from the complete upstream stdout and must contain all of
+  `audio/duration_s/description/anchors/model_dir/text_encoder_dir/device/
+  dtype/output_dir/network`; otherwise the call fails with `E_PLAN_INVALID`
+  instead of returning an empty success.
 * `upstream.stdout_tail` / `upstream.stderr_tail` — last 2000 characters of the
   SAM entry output; use these to explain upstream failures.
 
@@ -165,15 +169,18 @@ present produced audio; never present a dry-run or mock as a real separation.
 | `E_ENVIRONMENT` | 4 | set `--sam-root`/`SAM_AUDIO_ROOT`, point `--python` at the SAM environment interpreter, install model files under `model-cache/` |
 | `E_UPSTREAM_FAILED` | 5 | read `error.detail.upstream_exit_code` and the tails; common causes: CUDA requested but unavailable, missing shared FFmpeg DLLs (Windows needs the full-shared build), unreadable audio |
 | `E_UPSTREAM_TIMEOUT` | 6 | the run exceeded `--timeout`; raise it or shorten the input |
-| `E_RUN_DIR_UNKNOWN` / `E_OUTPUT_MISSING` | 7 | inspect `upstream.stdout_tail`; the SAM entry claimed success but artifacts are missing |
+| `E_RUN_DIR_UNKNOWN` / `E_OUTPUT_MISSING` / `E_PLAN_INVALID` / `E_REPORT_INVALID` | 7 | inspect `upstream.stdout_tail`; the SAM entry claimed success but the run directory, artifacts, plan or `report.json` are missing/unreadable — such a run is **not** a valid machine-readable result |
 
 Re-run `sam check-environment` after any environment change; re-run the dry-run
 before retrying real inference.
 
 ## 隐私边界 / Privacy boundaries
 
-* Everything runs **locally and offline**. The wrapper sets `HF_HUB_OFFLINE=1`
-  and `TRANSFORMERS_OFFLINE=1`, performs no downloads, and reads no API keys.
+* Everything runs **locally and offline**. The wrapper forces `HF_HUB_OFFLINE=1`
+  and `TRANSFORMERS_OFFLINE=1` in the child process **unconditionally** (an
+  inherited `HF_HUB_OFFLINE=0` is overridden there), performs no downloads, and
+  reads no API keys. Child output is decoded UTF-8 with replacement, so odd
+  bytes cannot crash the tool or leak half-decoded text.
 * Never commit or upload input audio, model weights, API keys, full session
   logs, or personal absolute paths. Redact paths to placeholders when writing
   public reports.
